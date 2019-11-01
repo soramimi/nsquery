@@ -6,15 +6,15 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-#include <vector>
 #include <string>
+#include <vector>
+#include <map>
 
 #define stricmp(A, B) strcasecmp(A, B)
 
-std::string encode_netbios_name(char const *name)
+void encode_netbios_name(char const *name, std::vector<uint8_t> *out)
 {
-	std::vector<char> vec;
-	vec.reserve(32);
+	out->clear();
 	for (int i = 0; i < 16; i++) {
 		int c = 0;
 		if (i < 15) {
@@ -27,10 +27,9 @@ std::string encode_netbios_name(char const *name)
 		}
 		int a = 'A' + (c >> 4);
 		int b = 'A' + (c & 0x0f);
-		vec.push_back(a);
-		vec.push_back(b);
+		out->push_back(a);
+		out->push_back(b);
 	}
-	return vec.empty() ? std::string() : std::string(vec.data(), vec.size());
 }
 
 std::string decode_netbios_name(char const *bytes, int len)
@@ -46,16 +45,48 @@ std::string decode_netbios_name(char const *bytes, int len)
 	return vec.empty() ? std::string() : std::string(vec.data(), vec.size());
 }
 
+static int getname(char const *buf, char const *end, int pos, std::string *out)
+{
+	while (buf + pos < end) {
+		int n = (uint8_t)buf[pos];
+		pos++;
+		if (n == 0) break;
+		if ((n & 0xc0) == 0xc0) {
+			n = (n & 0x3f) | (uint8_t)buf[pos];
+			pos++;
+			getname(buf, end, n, out);
+			break;
+		}
+		if (!out->empty()) {
+			*out += '.';
+		}
+		*out += std::string(buf + pos, n);
+		pos += n;
+	}
+	return pos;
+}
+
 int main()
 {
-	const uint32_t timezone = 9 * 60 * 60; // +0900 JST
-
 	enum Mode {
+		DNS,
+		MDNS,
 		WINS,
 		LLMNR,
 	};
-	Mode mode = LLMNR;
-	std::string name = "grace";
+
+	Mode mode = DNS;
+	std::string name = "www.twitter.com";
+
+//	Mode mode = MDNS;
+//	std::string name = "mac-mini-mojave.local";
+
+//	Mode mode = WINS;
+//	std::string name = "nas";
+
+//	Mode mode = LLMNR;
+//	std::string name = "julia";
+
 
 	int sock;
 	struct sockaddr_in addr;
@@ -68,24 +99,29 @@ int main()
 	sock = socket(AF_INET, SOCK_DGRAM, 0);
 	// 待ち受けポート番号を137にするためにbind()を行う
 	addr.sin_family = AF_INET;
-	int yes = 1;
 	if (mode == WINS) {
+		int yes = 1;
 		addr.sin_port = htons(137);
 		addr.sin_addr.s_addr = INADDR_BROADCAST;
 		setsockopt(sock, SOL_SOCKET, SO_BROADCAST, (char *)&yes, sizeof(yes));
 	} else if (mode == LLMNR) {
 		addr.sin_port = htons(5355);
 		addr.sin_addr.s_addr = INADDR_ANY;
+	} else if (mode == MDNS) {
+		addr.sin_port = htons(5353);
+		addr.sin_addr.s_addr = INADDR_ANY;
+	} else if (mode == DNS) {
+		addr.sin_port = htons(53);
+		addr.sin_addr.s_addr = htonl(0x08080808); // 8.8.8.8
 	}
 	bind(sock, (struct sockaddr *)&addr, sizeof(addr));
 	// 問い合わせパケットを送信
 	{
-		std::string s;
-		if (mode == WINS) {
-			s = encode_netbios_name(name.c_str());
-		} else {
-			s = name;
-		}
+		size_t pos;
+		auto Write16 = [&](uint16_t v){
+			buf[pos++] = v >> 8;
+			buf[pos++] = v & 255;
+		};
 
 		memset(buf, 0, sizeof(buf));
 
@@ -100,28 +136,52 @@ int main()
 		p[3] = htons(0); // ANCOUNT
 		p[4] = htons(0); // NSCOUNT
 		p[5] = htons(0); // ARCOUNT
-		size_t n = s.size();
-		buf[12] = n;
-		for (int i = 0; i < n; i++) {
-			buf[13 + i] = s[i];
+		pos = 6 * 2;
+		{
+			std::vector<uint8_t> namebytes;
+			if (mode == WINS) {
+				encode_netbios_name(name.c_str(), &namebytes);
+			} else {
+				char const *p = name.c_str();
+				namebytes.assign(p, p + name.size());
+			}
+			uint8_t const *src = namebytes.data();
+			uint8_t const *end = src + namebytes.size();
+			int n = 0;
+			while (1) {
+				int c = 0;
+				if (src + n < end) {
+					c = (unsigned char)src[n];
+				}
+				if (c == '.' || c == 0) {
+					buf[pos++] = n;
+					memcpy(buf + pos, src, n);
+					pos += n;
+					src += n;
+					if (c == 0) {
+						buf[pos++] = 0;
+						break;
+					}
+					src++;
+					n = 0;
+				} else {
+					n++;
+				}
+			}
 		}
-		n += 13;
-		buf[n++] = 0;
-		auto WriteS = [&](uint16_t v){
-			buf[n++] = v >> 8;
-			buf[n++] = v & 255;
-		};
 		if (mode == WINS) {
-			WriteS(0x0020); // Type: NB
+			Write16(0x0020); // Type: NB
 		} else {
-			WriteS(0x0001); // Type: A
+			Write16(0x0001); // Type: A
 		}
-		WriteS(0x0001); // Class: IN
+		Write16(0x0001); // Class: IN
 
-		if (mode == LLMNR) {
+		if (mode == MDNS) {
+			addr.sin_addr.s_addr = htonl(0xe00000fb); // 224.0.0.251
+		} else if (mode == LLMNR) {
 			addr.sin_addr.s_addr = htonl(0xe00000fc); // 224.0.0.252
 		}
-		sendto(sock, buf, n, 0, (struct sockaddr *)&addr, sizeof(addr));
+		sendto(sock, buf, pos, 0, (struct sockaddr *)&addr, sizeof(addr));
 	}
 	// 応答パケットを受信
 	{
@@ -133,12 +193,33 @@ int main()
 		inet_ntop(AF_INET, &senderinfo.sin_addr, senderstr, sizeof(senderstr));
 		printf("recvfrom : %s, port=%d, length=%d\n", senderstr, ntohs(senderinfo.sin_port), len);
 		if (len > 0) {
+			struct Answer {
+				std::string name;
+				uint32_t addr;
+				Answer() = default;
+				Answer(std::string const &name, uint32_t addr)
+					: name(name)
+					, addr(addr)
+				{
+				}
+			};
+
 			std::vector<uint32_t> addrs;
-			int pos;
+			std::vector<Answer> answers;
+			std::map<std::string, std::string> cnames;
+			char const *end = buf + len;
+			size_t pos;
 			auto Read16 = [&](){
-				uint8_t h = (uint8_t)buf[pos++];
-				uint8_t l = (uint8_t)buf[pos++];
-				return (h << 8) | l;
+				uint8_t const *p = (uint8_t const *)(buf + pos);
+				uint16_t v = (p[0] << 8) | p[1];
+				pos += 2;
+				return v;
+			};
+			auto Read32 = [&](){
+				uint8_t const *p = (uint8_t const *)(buf + pos);
+				uint32_t v = (p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3];
+				pos += 4;
+				return v;
 			};
 			uint16_t *p = (uint16_t *)buf;
 			uint16_t id = ntohs(p[0]); // ID
@@ -148,82 +229,72 @@ int main()
 			uint16_t nscount = ntohs(p[4]); // NSCOUNT
 			uint16_t arcount = ntohs(p[5]); // ARCOUNT
 			int i = 6 * 2;
+			pos = 6 * 2;
 			for (int j = 0; j < qdcount; j++) {
-				int n = (uint8_t)buf[i];
-				if (n == 0) {
-					i += 4;
-				}
-				i += n;
+				std::string aname;
+				pos = getname(buf, end, pos, &aname);
+				Read16();
+				Read16();
 			}
-			if (ancount == 1) {
-				pos = 6 * 2;
-				int n = (uint8_t)buf[pos];
-				if (buf[pos + 1 + n] == 0) {
-					std::string aname(buf + pos + 1, n);
-					if (mode == WINS) {
-						aname = decode_netbios_name(aname.c_str(), aname.size());
+			for (int a = 0; a < ancount; a++) {
+				std::string aname;
+				pos = getname(buf, end, pos, &aname);
+				if (mode == WINS) {
+					aname = decode_netbios_name(aname.c_str(), aname.size());
+				}
+				uint16_t type = Read16();
+				uint16_t clas = Read16();
+				uint32_t time = Read32();
+				if (mode == WINS) {
+					uint16_t dlen = Read16(); // data length
+					if (dlen == 6) {
+						while (pos + 5 < len) {
+							Read16(); // flags
+							uint32_t addr = Read32();
+							answers.emplace_back(aname, addr);
+						}
 					}
-					if (stricmp(aname.c_str(), name.c_str()) == 0) {
-						pos += n + 2;
-						uint16_t type = Read16();
-						uint16_t clas = Read16();
-						bool ok = false;
-						if (mode == WINS) {
-							ok = (type == 32 && clas == 1);
-						} else if (mode == LLMNR) {
-							ok = (type == 1 && clas == 1);
+				} else if (mode == LLMNR || mode == MDNS || mode == DNS) {
+					if (type == 1 && clas == 1) {
+						int n = Read16(); // data length
+						if (n == 4) {
+							uint32_t addr = Read32();
+							answers.emplace_back(aname, addr);
+						} else {
+							pos += n;
 						}
-						if (ok) {
-							if (mode == WINS) {
-								pos += 4; // skip time
-								n = Read16(); // data length
-								while (pos + 5 < len) {
-									uint16_t flags2 = ntohs(*(uint16_t *)(buf + pos));
-									uint32_t addr;
-									memcpy(&addr, buf + pos + 2, 4);
-									addr = ntohl(addr);
-									addrs.push_back(addr);
-									pos += 6;
-								}
-							} else if (mode == LLMNR) {
-								while (1) {
-									uint8_t n = buf[pos++];
-									if (n == 0) break;
-									pos += n;
-								}
-								uint16_t type = Read16();
-								uint16_t clas = Read16();
-								pos += 4; // skip time
-								n = Read16(); // data length
-								uint32_t addr;
-								memcpy(&addr, buf + pos, 4);
-								addr = ntohl(addr);
-								addrs.push_back(addr);
-								pos += 4;
-							}
+					} else if (type == 5 && clas == 1) { // CNAME
+						int n = Read16(); // data length
+						if (n == 2) {
+							std::string cname;
+							getname(buf, buf + pos + n, pos, &cname);
+							cnames[aname] = cname;
 						}
+						pos += n;
 					}
 				}
 			}
 
+			auto it = cnames.find(name);
+			if (it != cnames.end()) {
+				name = it->second;
+			}
 
-			if (!addrs.empty()) {
-				uint32_t from = ntohl(senderinfo.sin_addr.s_addr);
-				uint32_t addr = 0;
-				uint32_t diff = 0;
-				for (int i = 0; i < addrs.size(); i++) {
-					uint32_t a = addrs[i];
-					uint32_t d = (a > from) ? (a - from) : (from - a);
-					if (i == 0 || diff > d) {
-						addr = a;
-						diff = d;
+
+			if (!answers.empty()) {
+				for (int i = 0; i < answers.size(); i++) {
+					Answer const &ans = answers[i];
+					if (stricmp(ans.name.c_str(), name.c_str()) == 0) {
+						addrs.push_back(ans.addr);
 					}
 				}
-				int a = (addr >> 24) & 255;
-				int b = (addr >> 16) & 255;
-				int c = (addr >> 8) & 255;
-				int d = addr & 255;
-				printf("%u.%u.%u.%u\n", a, b, c, d);
+				for (uint32_t addr : addrs) {
+					int a = (addr >> 24) & 255;
+					int b = (addr >> 16) & 255;
+					int c = (addr >> 8) & 255;
+					int d = addr & 255;
+					printf("%u.%u.%u.%u\n", a, b, c, d);
+				}
 			}
 
 		}
