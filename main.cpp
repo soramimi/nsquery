@@ -75,11 +75,11 @@ int main()
 		LLMNR,
 	};
 
-	Mode mode = DNS;
-	std::string name = "www.twitter.com";
+//	Mode mode = DNS;
+//	std::string name = "www.twitter.com";
 
-//	Mode mode = MDNS;
-//	std::string name = "mac-mini-mojave.local";
+	Mode mode = MDNS;
+	std::string name = "aimeq-p-31.local";
 
 //	Mode mode = WINS;
 //	std::string name = "nas";
@@ -87,6 +87,7 @@ int main()
 //	Mode mode = LLMNR;
 //	std::string name = "julia";
 
+	bool multicast = false;
 
 	int sock;
 	struct sockaddr_in addr;
@@ -107,9 +108,11 @@ int main()
 	} else if (mode == LLMNR) {
 		addr.sin_port = htons(5355);
 		addr.sin_addr.s_addr = INADDR_ANY;
+		multicast = true;
 	} else if (mode == MDNS) {
 		addr.sin_port = htons(5353);
 		addr.sin_addr.s_addr = INADDR_ANY;
+		multicast = true;
 	} else if (mode == DNS) {
 		addr.sin_port = htons(53);
 		addr.sin_addr.s_addr = htonl(0x08080808); // 8.8.8.8
@@ -184,6 +187,12 @@ int main()
 		sendto(sock, buf, pos, 0, (struct sockaddr *)&addr, sizeof(addr));
 	}
 	// 応答パケットを受信
+	if (multicast) {
+		struct ip_mreq mreq = {};
+		mreq.imr_interface.s_addr = INADDR_ANY;
+		mreq.imr_multiaddr.s_addr = htonl(0xe00000fb); // 224.0.0.251
+		setsockopt(sock, IPPROTO_IP, IP_ADD_MEMBERSHIP, (void *)&mreq, sizeof(mreq));
+	}
 	{
 		memset(buf, 0, sizeof(buf));
 		// recvfrom()を利用してUDPソケットからデータを受信
